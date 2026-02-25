@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use gpui::{
-    div, prelude::FluentBuilder, px, App, AppContext as _, Context, Entity,
-    InteractiveElement as _, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement as _, Styled, Window,
+    actions, div, px, App, AppContext as _, Context, Entity, Focusable,
+    FocusHandle, InteractiveElement as _, IntoElement, KeyBinding, ParentElement, Render,
+    SharedString, StatefulInteractiveElement as _, Styled, Window,
 };
 use gpui_component::{
     checkbox::Checkbox, h_flex, input::InputState, radio::Radio, switch::Switch, v_flex,
@@ -17,6 +17,41 @@ use crate::node::{
 };
 use crate::NodeFilter;
 
+/// Fixed min-width for the controls column so descriptions align vertically.
+const CONTROLS_WIDTH: f32 = 400.0;
+
+// --- Actions ---
+
+actions!(
+    schema_form,
+    [
+        SelectUp,
+        SelectDown,
+        ToggleOrExpand,
+        ConfirmAction,
+        ExpandNode,
+        CollapseNode,
+        CancelEdit,
+        DeleteOption,
+    ]
+);
+
+/// Register key bindings for SchemaForm keyboard navigation.
+/// Call this once in your application's setup, after `gpui_component::init(cx)`.
+pub fn init(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("up", SelectUp, Some("SchemaForm")),
+        KeyBinding::new("down", SelectDown, Some("SchemaForm")),
+        KeyBinding::new("space", ToggleOrExpand, Some("SchemaForm")),
+        KeyBinding::new("enter", ConfirmAction, Some("SchemaForm")),
+        KeyBinding::new("right", ExpandNode, Some("SchemaForm")),
+        KeyBinding::new("left", CollapseNode, Some("SchemaForm")),
+        KeyBinding::new("escape", CancelEdit, Some("SchemaForm")),
+        KeyBinding::new("backspace", DeleteOption, Some("SchemaForm")),
+        KeyBinding::new("delete", DeleteOption, Some("SchemaForm")),
+    ]);
+}
+
 /// A GUI form for editing a configuration derived from a JSON Schema.
 ///
 /// Create one with [`SchemaForm::new`], passing a `schemars::Schema` and
@@ -28,6 +63,15 @@ pub struct SchemaForm {
     filter: Option<Box<dyn NodeFilter>>,
     inputs: Vec<(String, Entity<InputState>)>,
     dirty: bool,
+    focus_handle: FocusHandle,
+    selected: usize,
+    editing_path: Option<String>,
+}
+
+impl Focusable for SchemaForm {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
 }
 
 impl SchemaForm {
@@ -54,6 +98,9 @@ impl SchemaForm {
             filter: None,
             inputs: Vec::new(),
             dirty: false,
+            focus_handle: cx.focus_handle(),
+            selected: 0,
+            editing_path: None,
         };
         form.rebuild_inputs(window, cx);
         form
@@ -82,7 +129,7 @@ impl SchemaForm {
         self.dirty
     }
 
-    // --- internal ---
+    // --- Input sync ---
 
     fn sync_inputs_to_nodes(&mut self, cx: &App) {
         for (path, input_entity) in &self.inputs {
@@ -148,10 +195,24 @@ impl SchemaForm {
                         });
                         cx.subscribe(&input, {
                             move |this: &mut SchemaForm, _entity, event: &gpui_component::input::InputEvent, cx| {
-                                if matches!(event, gpui_component::input::InputEvent::Change) {
-                                    this.dirty = true;
-                                    this.sync_inputs_to_nodes(cx);
-                                    cx.notify();
+                                match event {
+                                    gpui_component::input::InputEvent::Change => {
+                                        this.dirty = true;
+                                        this.sync_inputs_to_nodes(cx);
+                                        cx.notify();
+                                    }
+                                    gpui_component::input::InputEvent::Focus => {
+                                        // editing_path is set by focus_input_at;
+                                        // mouse-driven focus on an Input is prevented
+                                        // because we only render the Input widget when
+                                        // editing_path matches. So this is a no-op guard.
+                                        cx.notify();
+                                    }
+                                    gpui_component::input::InputEvent::Blur => {
+                                        this.editing_path = None;
+                                        cx.notify();
+                                    }
+                                    _ => {}
                                 }
                             }
                         })
@@ -186,6 +247,40 @@ impl SchemaForm {
             None => true,
         }
     }
+
+    // --- Focus helpers ---
+
+    fn editing(&self) -> bool {
+        self.editing_path.is_some()
+    }
+
+    fn focus_input_at(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_path = Some(path.to_string());
+        // Focus the input entity — it exists even when rendered as text
+        if let Some(input_entity) = self.find_input(path).cloned() {
+            input_entity.update(cx, |state, cx| {
+                state.focus(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn blur_active_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_path = None;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.visible_flat_nodes().len();
+        if len == 0 {
+            self.selected = 0;
+        } else if self.selected >= len {
+            self.selected = len - 1;
+        }
+    }
+
+    // --- Mutations ---
 
     fn toggle_bool(&mut self, path: &str, cx: &mut Context<Self>) {
         let parts: Vec<&str> = path.split('.').collect();
@@ -278,393 +373,285 @@ impl SchemaForm {
         cx.notify();
     }
 
-    fn render_nodes(
-        &self,
-        nodes: &[ConfigNode],
-        prefix: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let mut container = v_flex().gap_1();
+    // --- Action handlers ---
 
-        for node in nodes {
-            let path = if prefix.is_empty() {
-                node.key.clone()
-            } else {
-                format!("{}.{}", prefix, node.key)
-            };
-
-            if let Some(ref f) = self.filter {
-                if !f.visible(&path) {
-                    continue;
-                }
-            }
-
-            let enabled = self.is_enabled(&path);
-            let row = self.render_node(node, &path, enabled, window, cx);
-            container = container.child(row);
+    fn on_select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing() {
+            cx.propagate();
+            return;
         }
-        container
+        if self.selected > 0 {
+            self.selected -= 1;
+            cx.notify();
+        }
     }
 
-    fn render_node(
+    fn on_select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing() {
+            cx.propagate();
+            return;
+        }
+        let len = self.visible_flat_nodes().len();
+        if len > 0 && self.selected < len - 1 {
+            self.selected += 1;
+            cx.notify();
+        }
+    }
+
+    fn on_toggle_or_expand(
+        &mut self,
+        _: &ToggleOrExpand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing() {
+            cx.propagate();
+            return;
+        }
+        let visible = self.visible_flat_nodes();
+        let Some((path, node)) = visible.get(self.selected).cloned() else {
+            return;
+        };
+        if !self.is_enabled(&path) {
+            return;
+        }
+        match &node.kind {
+            NodeKind::Bool => self.toggle_bool(&path, cx),
+            NodeKind::CheckboxItem { .. } => self.toggle_checkbox(&path, window, cx),
+            NodeKind::RadioItem { .. } => {
+                if let Some(dot) = path.rfind('.') {
+                    let parent = path[..dot].to_string();
+                    let variant = node.key.clone();
+                    self.select_radio(&parent, &variant, window, cx);
+                }
+            }
+            NodeKind::Option { .. } => self.toggle_option(&path, window, cx),
+            NodeKind::Struct { .. } | NodeKind::RadioGroup { .. } | NodeKind::Checkboxes { .. } => {
+                self.toggle_expand(&path, cx);
+            }
+            _ => {}
+        }
+        self.clamp_selection();
+    }
+
+    fn on_confirm(
+        &mut self,
+        _: &ConfirmAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing() {
+            self.blur_active_input(window, cx);
+            return;
+        }
+        let visible = self.visible_flat_nodes();
+        let Some((path, node)) = visible.get(self.selected).cloned() else {
+            return;
+        };
+        if !self.is_enabled(&path) {
+            return;
+        }
+        match &node.kind {
+            NodeKind::String | NodeKind::Integer | NodeKind::Float => {
+                self.focus_input_at(&path, window, cx);
+            }
+            NodeKind::Option {
+                is_some: true,
+                inner_kind: Some(_),
+            } => {
+                self.focus_input_at(&path, window, cx);
+            }
+            NodeKind::Bool => self.toggle_bool(&path, cx),
+            NodeKind::Struct { .. } | NodeKind::RadioGroup { .. } | NodeKind::Checkboxes { .. } => {
+                self.toggle_expand(&path, cx);
+            }
+            NodeKind::Option { .. } => self.toggle_option(&path, window, cx),
+            NodeKind::RadioItem { .. } => {
+                if let Some(dot) = path.rfind('.') {
+                    let parent = path[..dot].to_string();
+                    let variant = node.key.clone();
+                    self.select_radio(&parent, &variant, window, cx);
+                }
+            }
+            NodeKind::CheckboxItem { .. } => self.toggle_checkbox(&path, window, cx),
+        }
+        self.clamp_selection();
+    }
+
+    fn on_expand_node(
+        &mut self,
+        _: &ExpandNode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing() {
+            cx.propagate();
+            return;
+        }
+        let visible = self.visible_flat_nodes();
+        let Some((path, node)) = visible.get(self.selected).cloned() else {
+            return;
+        };
+        let expandable = matches!(
+            &node.kind,
+            NodeKind::Struct { .. }
+                | NodeKind::RadioGroup { .. }
+                | NodeKind::Checkboxes { .. }
+                | NodeKind::Option {
+                    is_some: true,
+                    inner_kind: None,
+                }
+        ) || matches!(
+            &node.kind,
+            NodeKind::RadioItem {
+                selected: true,
+                is_struct: true,
+            }
+        );
+        if expandable && !self.expanded.contains(&path) {
+            self.expanded.insert(path);
+            cx.notify();
+        }
+    }
+
+    fn on_collapse_node(
+        &mut self,
+        _: &CollapseNode,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing() {
+            cx.propagate();
+            return;
+        }
+        let visible = self.visible_flat_nodes();
+        let Some((path, node)) = visible.get(self.selected).cloned() else {
+            return;
+        };
+        let expandable = matches!(
+            &node.kind,
+            NodeKind::Struct { .. }
+                | NodeKind::RadioGroup { .. }
+                | NodeKind::Checkboxes { .. }
+                | NodeKind::Option {
+                    is_some: true,
+                    inner_kind: None,
+                }
+        ) || matches!(
+            &node.kind,
+            NodeKind::RadioItem {
+                selected: true,
+                is_struct: true,
+            }
+        );
+        if expandable && self.expanded.contains(&path) {
+            self.expanded.remove(&path);
+            self.clamp_selection();
+            cx.notify();
+        } else if let Some(dot) = path.rfind('.') {
+            // On a leaf: collapse parent and select it
+            let parent = path[..dot].to_string();
+            if self.expanded.contains(&parent) {
+                self.expanded.remove(&parent);
+                let visible_after = self.visible_flat_nodes();
+                if let Some(idx) = visible_after.iter().position(|(p, _)| *p == parent) {
+                    self.selected = idx;
+                }
+                self.clamp_selection();
+                cx.notify();
+            }
+        }
+    }
+
+    fn on_cancel_edit(
+        &mut self,
+        _: &CancelEdit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing() {
+            self.blur_active_input(window, cx);
+        }
+    }
+
+    fn on_delete_option(
+        &mut self,
+        _: &DeleteOption,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing() {
+            cx.propagate();
+            return;
+        }
+        let visible = self.visible_flat_nodes();
+        let Some((path, node)) = visible.get(self.selected).cloned() else {
+            return;
+        };
+        if let NodeKind::Option { is_some: true, .. } = &node.kind {
+            if self.is_enabled(&path) {
+                self.toggle_option(&path, window, cx);
+                self.clamp_selection();
+            }
+        }
+    }
+
+    // --- Rendering ---
+
+    fn render_flat_row(
         &self,
         node: &ConfigNode,
         path: &str,
+        is_selected: bool,
         enabled: bool,
-        window: &mut Window,
+        index: usize,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let depth = node.depth;
         let indent = px(depth as f32 * 20.0);
-        let is_expanded = self.expanded.contains(path);
         let opacity = if enabled { 1.0 } else { 0.5 };
+        let is_expanded = self.expanded.contains(path);
 
-        match &node.kind {
-            NodeKind::Bool => {
-                let checked = node.value.as_bool().unwrap_or(false);
-                let path_owned = path.to_string();
-                h_flex()
-                    .pl(indent)
-                    .py_0p5()
-                    .gap_2()
-                    .opacity(opacity)
-                    .child(
-                        Switch::new(SharedString::from(path.to_string()))
-                            .checked(checked)
-                            .disabled(!enabled)
-                            .on_click(cx.listener({
-                                let path = path_owned.clone();
-                                move |this, _checked: &bool, _window, cx| {
-                                    this.toggle_bool(&path, cx);
-                                }
-                            }))
-                            .small(),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(format_label(&node.key)),
-                    )
-                    .when(node.description.is_some(), |el| {
-                        el.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(node.description.clone().unwrap_or_default()),
-                        )
-                    })
-                    .into_any_element()
-            }
-            NodeKind::String | NodeKind::Integer | NodeKind::Float => {
-                self.render_scalar_field(node, path, indent, enabled, opacity, window, cx)
-            }
-            NodeKind::Struct { type_name } => {
-                let path_owned = path.to_string();
-                let arrow = if is_expanded { "▼" } else { "▶" };
-                let mut col = v_flex().gap_1();
-                col = col.child(
-                    h_flex()
-                        .id(SharedString::from(format!("hdr-{}", path)))
-                        .pl(indent)
-                        .py_0p5()
-                        .gap_2()
-                        .opacity(opacity)
-                        .cursor_pointer()
-                        .on_click(cx.listener({
-                            let path = path_owned.clone();
-                            move |this, _ev: &gpui::ClickEvent, _window, cx| {
-                                this.toggle_expand(&path, cx);
-                            }
-                        }))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().foreground)
-                                .child(format!(
-                                    "{} {} ({})",
-                                    arrow,
-                                    format_label(&node.key),
-                                    type_name
-                                )),
-                        )
-                        .when(node.description.is_some(), |el| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(node.description.clone().unwrap_or_default()),
-                            )
-                        }),
-                );
-                if is_expanded {
-                    col = col.child(self.render_nodes(&node.children, &path_owned, window, cx));
-                }
-                col.into_any_element()
-            }
-            NodeKind::Option {
-                is_some,
-                inner_kind,
-            } => {
-                let path_owned = path.to_string();
+        let controls = self.render_row_controls(node, path, enabled, is_expanded, cx);
 
-                if inner_kind.is_some() {
-                    // Scalar option: switch + inline value
-                    // Use a fixed row height (h_6 = 24px matches Input::small)
-                    // so toggling between Some/None doesn't change the row height.
-                    let mut row = h_flex()
-                        .pl(indent)
-                        .h_6()
-                        .gap_2()
-                        .items_center()
-                        .opacity(opacity);
-
-                    row = row.child(
-                        Switch::new(SharedString::from(format!("{}-opt", path)))
-                            .checked(*is_some)
-                            .disabled(!enabled)
-                            .on_click(cx.listener({
-                                let path = path_owned.clone();
-                                move |this, _checked: &bool, window, cx| {
-                                    this.toggle_option(&path, window, cx);
-                                }
-                            }))
-                            .small(),
-                    );
-                    row = row.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(format_label(&node.key)),
-                    );
-
-                    if *is_some {
-                        if let Some(input_entity) = self.find_input(&path_owned) {
-                            row = row.child(
-                                gpui_component::input::Input::new(input_entity)
-                                    .appearance(false)
-                                    .xsmall()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .disabled(!enabled),
-                            );
-                        }
-                    } else {
-                        row = row.child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("None"),
-                        );
-                    }
-
-                    if let Some(desc) = &node.description {
-                        row = row.child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(desc.clone()),
-                        );
-                    }
-
-                    row.into_any_element()
-                } else {
-                    // Struct option: expandable section with switch
-                    let arrow = if *is_some && is_expanded {
-                        "▼"
-                    } else if *is_some {
-                        "▶"
-                    } else {
-                        " "
-                    };
-                    let mut col = v_flex().gap_1();
-                    col = col.child(
-                        h_flex()
-                            .pl(indent)
-                            .py_0p5()
-                            .gap_2()
-                            .opacity(opacity)
-                            .child(
-                                Switch::new(SharedString::from(format!("{}-opt", path)))
-                                    .checked(*is_some)
-                                    .disabled(!enabled)
-                                    .on_click(cx.listener({
-                                        let path = path_owned.clone();
-                                        move |this, _checked: &bool, window, cx| {
-                                            this.toggle_option(&path, window, cx);
-                                        }
-                                    }))
-                                    .small(),
-                            )
-                            .child(
-                                div()
-                                    .id(SharedString::from(format!("opt-lbl-{}", path)))
-                                    .text_sm()
-                                    .text_color(cx.theme().foreground)
-                                    .cursor_pointer()
-                                    .when(*is_some, |el| {
-                                        el.on_click(cx.listener({
-                                            let path = path_owned.clone();
-                                            move |this, _ev: &gpui::ClickEvent, _window, cx| {
-                                                this.toggle_expand(&path, cx);
-                                            }
-                                        }))
-                                    })
-                                    .child(format!("{} {}", arrow, format_label(&node.key))),
-                            )
-                            .when(node.description.is_some(), |el| {
-                                el.child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(node.description.clone().unwrap_or_default()),
-                                )
-                            }),
-                    );
-
-                    if *is_some && is_expanded {
-                        col = col
-                            .child(self.render_nodes(&node.children, &path_owned, window, cx));
-                    }
-                    col.into_any_element()
-                }
-            }
-            NodeKind::RadioGroup { .. } => {
-                let path_owned = path.to_string();
-                let arrow = if is_expanded { "▼" } else { "▶" };
-                let mut col = v_flex().gap_1();
-                col = col.child(
-                    h_flex()
-                        .id(SharedString::from(format!("rg-{}", path)))
-                        .pl(indent)
-                        .py_0p5()
-                        .gap_2()
-                        .opacity(opacity)
-                        .cursor_pointer()
-                        .on_click(cx.listener({
-                            let path = path_owned.clone();
-                            move |this, _ev: &gpui::ClickEvent, _window, cx| {
-                                this.toggle_expand(&path, cx);
-                            }
-                        }))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().foreground)
-                                .child(format!("{} {}", arrow, format_label(&node.key))),
-                        )
-                        .when(node.description.is_some(), |el| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(node.description.clone().unwrap_or_default()),
-                            )
-                        }),
-                );
-                if is_expanded {
-                    for child in &node.children {
-                        let child_path = format!("{}.{}", path_owned, child.key);
-                        let child_enabled = self.is_enabled(&child_path);
-                        col = col.child(self.render_radio_item(
-                            child,
-                            &child_path,
-                            &path_owned,
-                            child_enabled,
-                            window,
-                            cx,
-                        ));
-                    }
-                }
-                col.into_any_element()
-            }
-            NodeKind::RadioItem { .. } => div().into_any_element(),
-            NodeKind::Checkboxes { .. } => {
-                let path_owned = path.to_string();
-                let arrow = if is_expanded { "▼" } else { "▶" };
-                let mut col = v_flex().gap_1();
-                col = col.child(
-                    h_flex()
-                        .id(SharedString::from(format!("cb-{}", path)))
-                        .pl(indent)
-                        .py_0p5()
-                        .gap_2()
-                        .opacity(opacity)
-                        .cursor_pointer()
-                        .on_click(cx.listener({
-                            let path = path_owned.clone();
-                            move |this, _ev: &gpui::ClickEvent, _window, cx| {
-                                this.toggle_expand(&path, cx);
-                            }
-                        }))
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().foreground)
-                                .child(format!("{} {}", arrow, format_label(&node.key))),
-                        )
-                        .when(node.description.is_some(), |el| {
-                            el.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(node.description.clone().unwrap_or_default()),
-                            )
-                        }),
-                );
-                if is_expanded {
-                    for child in &node.children {
-                        let child_path = format!("{}.{}", path_owned, child.key);
-                        let child_enabled = self.is_enabled(&child_path);
-                        col = col.child(self.render_checkbox_item(
-                            child, &child_path, child_enabled, cx,
-                        ));
-                    }
-                }
-                col.into_any_element()
-            }
-            NodeKind::CheckboxItem { .. } => div().into_any_element(),
-        }
-    }
-
-    fn render_scalar_field(
-        &self,
-        node: &ConfigNode,
-        path: &str,
-        indent: gpui::Pixels,
-        enabled: bool,
-        opacity: f32,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+        let idx = index;
         let mut row = h_flex()
-            .pl(indent)
-            .py_0p5()
-            .gap_2()
+            .id(SharedString::from(format!("row-{}", idx)))
+            .h_6()
             .items_center()
-            .opacity(opacity);
+            .opacity(opacity)
+            .w_full()
+            .rounded_sm()
+            .cursor_pointer()
+            .on_click(cx.listener({
+                move |this, _ev: &gpui::ClickEvent, window, cx| {
+                    this.selected = idx;
+                    this.focus_handle.focus(window);
+                    cx.notify();
+                }
+            }));
 
+        if is_selected && !self.editing() {
+            row = row.bg(cx.theme().list_active);
+        }
+
+        // Left column: fixed width, indent is internal padding
         row = row.child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().foreground)
-                .min_w(px(120.0))
-                .child(format_label(&node.key)),
+            h_flex()
+                .w(px(CONTROLS_WIDTH))
+                .flex_shrink_0()
+                .pl(indent)
+                .gap_2()
+                .items_center()
+                .child(controls),
         );
 
-        if let Some(input_entity) = self.find_input(path) {
-            row = row.child(
-                div().w(px(200.0)).child(
-                    gpui_component::input::Input::new(input_entity)
-                        .small()
-                        .disabled(!enabled),
-                ),
-            );
-        }
-
+        // Right column: description, left-aligned
         if let Some(desc) = &node.description {
             row = row.child(
                 div()
+                    .pl_2()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(desc.clone()),
@@ -674,109 +661,342 @@ impl SchemaForm {
         row.into_any_element()
     }
 
-    fn render_radio_item(
-        &self,
-        node: &ConfigNode,
-        path: &str,
-        parent_path: &str,
-        enabled: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let NodeKind::RadioItem {
-            selected,
-            is_struct,
-        } = &node.kind
-        else {
-            return div().into_any_element();
-        };
-        let depth = node.depth;
-        let indent = px(depth as f32 * 20.0);
-        let opacity = if enabled { 1.0 } else { 0.5 };
-        let parent_owned = parent_path.to_string();
-        let variant = node.key.clone();
-        let is_expanded = self.expanded.contains(path);
-
-        let mut col = v_flex().gap_1();
-
-        let row = h_flex()
-            .pl(indent)
-            .py_0p5()
-            .gap_2()
-            .opacity(opacity)
-            .child(
-                Radio::new(SharedString::from(path.to_string()))
-                    .label(format_label(&node.key))
-                    .checked(*selected)
-                    .disabled(!enabled)
-                    .on_click(cx.listener({
-                        let parent = parent_owned.clone();
-                        let variant = variant.clone();
-                        move |this, _checked: &bool, window, cx| {
-                            this.select_radio(&parent, &variant, window, cx);
-                        }
-                    }))
-                    .small(),
-            );
-
-        col = col.child(row);
-
-        if *selected && *is_struct && is_expanded && !node.children.is_empty() {
-            col = col.child(self.render_nodes(&node.children, path, window, cx));
-        }
-
-        col.into_any_element()
-    }
-
-    fn render_checkbox_item(
+    fn render_row_controls(
         &self,
         node: &ConfigNode,
         path: &str,
         enabled: bool,
+        is_expanded: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let NodeKind::CheckboxItem { checked } = &node.kind else {
-            return div().into_any_element();
-        };
-        let depth = node.depth;
-        let indent = px(depth as f32 * 20.0);
-        let opacity = if enabled { 1.0 } else { 0.5 };
         let path_owned = path.to_string();
 
-        h_flex()
-            .pl(indent)
-            .py_0p5()
-            .gap_2()
-            .opacity(opacity)
-            .child(
-                Checkbox::new(SharedString::from(path.to_string()))
-                    .label(format_label(&node.key))
-                    .checked(*checked)
-                    .disabled(!enabled)
-                    .on_click(cx.listener({
-                        let path = path_owned;
-                        move |this, _checked: &bool, window, cx| {
-                            this.toggle_checkbox(&path, window, cx);
+        match &node.kind {
+            NodeKind::Bool => {
+                let checked = node.value.as_bool().unwrap_or(false);
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Switch::new(SharedString::from(path.to_string()))
+                            .checked(checked)
+                            .disabled(!enabled)
+                            .on_click(cx.listener({
+                                let p = path_owned.clone();
+                                move |this, _, _, cx| this.toggle_bool(&p, cx)
+                            }))
+                            .small(),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(format_label(&node.key)),
+                    )
+                    .into_any_element()
+            }
+
+            NodeKind::String | NodeKind::Integer | NodeKind::Float => {
+                let mut row = h_flex().gap_2().items_center().child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
+                        .min_w(px(120.0))
+                        .child(format_label(&node.key)),
+                );
+                let is_editing_this = self.editing_path.as_deref() == Some(path);
+                if is_editing_this {
+                    if let Some(input_entity) = self.find_input(path) {
+                        row = row.child(
+                            div().w(px(200.0)).child(
+                                gpui_component::input::Input::new(input_entity)
+                                    .appearance(false)
+                                    .xsmall()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .disabled(!enabled),
+                            ),
+                        );
+                    }
+                } else {
+                    let text = value_to_string(&node.value, &node.kind);
+                    row = row.child(
+                        div()
+                            .w(px(200.0))
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(text),
+                    );
+                }
+                row.into_any_element()
+            }
+
+            NodeKind::Struct { type_name } => {
+                let arrow = if is_expanded { "▼" } else { "▶" };
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{}-arrow", path)))
+                            .text_sm()
+                            .cursor_pointer()
+                            .child(arrow)
+                            .on_click(cx.listener({
+                                let p = path_owned.clone();
+                                move |this, _, _, cx| this.toggle_expand(&p, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(format!("{} ({})", format_label(&node.key), type_name)),
+                    )
+                    .into_any_element()
+            }
+
+            NodeKind::Option {
+                is_some,
+                inner_kind,
+            } => {
+                if inner_kind.is_some() {
+                    // Scalar option
+                    let mut row = h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Switch::new(SharedString::from(format!("{}-opt", path)))
+                                .checked(*is_some)
+                                .disabled(!enabled)
+                                .on_click(cx.listener({
+                                    let p = path_owned.clone();
+                                    move |this, _, window, cx| {
+                                        this.toggle_option(&p, window, cx);
+                                    }
+                                }))
+                                .small(),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .text_color(cx.theme().foreground)
+                                .min_w(px(120.0))
+                                .child(format_label(&node.key)),
+                        );
+
+                    if *is_some {
+                        let is_editing_this = self.editing_path.as_deref() == Some(path);
+                        if is_editing_this {
+                            if let Some(input_entity) = self.find_input(&path_owned) {
+                                row = row.child(
+                                    div().w(px(200.0)).child(
+                                        gpui_component::input::Input::new(input_entity)
+                                            .appearance(false)
+                                            .xsmall()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .disabled(!enabled),
+                                    ),
+                                );
+                            }
+                        } else {
+                            let ik = inner_kind.as_ref().unwrap();
+                            let text = value_to_string(&node.value, ik);
+                            row = row.child(
+                                div()
+                                    .w(px(200.0))
+                                    .text_sm()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(text),
+                            );
                         }
-                    }))
-                    .small(),
-            )
-            .into_any_element()
+                    } else {
+                        row = row.child(
+                            div()
+                                .w(px(200.0))
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child("None"),
+                        );
+                    }
+                    row.into_any_element()
+                } else {
+                    // Struct option
+                    let arrow = if *is_some && is_expanded {
+                        "▼"
+                    } else if *is_some {
+                        "▶"
+                    } else {
+                        " "
+                    };
+                    let mut row = h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Switch::new(SharedString::from(format!("{}-opt", path)))
+                                .checked(*is_some)
+                                .disabled(!enabled)
+                                .on_click(cx.listener({
+                                    let p = path_owned.clone();
+                                    move |this, _, window, cx| {
+                                        this.toggle_option(&p, window, cx);
+                                    }
+                                }))
+                                .small(),
+                        );
+                    if *is_some {
+                        row = row.child(
+                            div()
+                                .id(SharedString::from(format!("{}-arrow", path)))
+                                .text_sm()
+                                .cursor_pointer()
+                                .child(arrow)
+                                .on_click(cx.listener({
+                                    let p = path_owned.clone();
+                                    move |this, _, _, cx| this.toggle_expand(&p, cx)
+                                })),
+                        );
+                    }
+                    row = row.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(format_label(&node.key)),
+                    );
+                    row.into_any_element()
+                }
+            }
+
+            NodeKind::RadioGroup { .. } => {
+                let arrow = if is_expanded { "▼" } else { "▶" };
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{}-arrow", path)))
+                            .text_sm()
+                            .cursor_pointer()
+                            .child(arrow)
+                            .on_click(cx.listener({
+                                let p = path_owned.clone();
+                                move |this, _, _, cx| this.toggle_expand(&p, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(format_label(&node.key)),
+                    )
+                    .into_any_element()
+            }
+
+            NodeKind::RadioItem { selected, .. } => {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Radio::new(SharedString::from(path.to_string()))
+                            .label(format_label(&node.key))
+                            .checked(*selected)
+                            .disabled(!enabled)
+                            .on_click(cx.listener({
+                                let parent = path
+                                    .rfind('.')
+                                    .map(|i| path[..i].to_string())
+                                    .unwrap_or_default();
+                                let variant = node.key.clone();
+                                move |this, _, window, cx| {
+                                    this.select_radio(&parent, &variant, window, cx);
+                                }
+                            }))
+                            .small(),
+                    )
+                    .into_any_element()
+            }
+
+            NodeKind::CheckboxItem { checked } => {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Checkbox::new(SharedString::from(path.to_string()))
+                            .label(format_label(&node.key))
+                            .checked(*checked)
+                            .disabled(!enabled)
+                            .on_click(cx.listener({
+                                let p = path_owned;
+                                move |this, _, window, cx| {
+                                    this.toggle_checkbox(&p, window, cx);
+                                }
+                            }))
+                            .small(),
+                    )
+                    .into_any_element()
+            }
+
+            NodeKind::Checkboxes { .. } => {
+                let arrow = if is_expanded { "▼" } else { "▶" };
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("{}-arrow", path)))
+                            .text_sm()
+                            .cursor_pointer()
+                            .child(arrow)
+                            .on_click(cx.listener({
+                                let p = path_owned;
+                                move |this, _, _, cx| this.toggle_expand(&p, cx)
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().foreground)
+                            .child(format_label(&node.key)),
+                    )
+                    .into_any_element()
+            }
+        }
     }
 }
 
 impl Render for SchemaForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_inputs_to_nodes(cx);
+        self.clamp_selection();
 
-        let nodes = self.nodes.clone();
-        v_flex()
+        let visible = self.visible_flat_nodes();
+        let mut rows = v_flex().gap_0p5();
+
+        for (idx, (path, node)) in visible.iter().enumerate() {
+            let is_selected = idx == self.selected;
+            let enabled = self.is_enabled(path);
+            let row = self.render_flat_row(node, path, is_selected, enabled, idx, window, cx);
+            rows = rows.child(row);
+        }
+
+        div()
             .id("schema-form-root")
+            .track_focus(&self.focus_handle)
+            .key_context("SchemaForm")
+            .on_action(cx.listener(Self::on_select_up))
+            .on_action(cx.listener(Self::on_select_down))
+            .on_action(cx.listener(Self::on_toggle_or_expand))
+            .on_action(cx.listener(Self::on_confirm))
+            .on_action(cx.listener(Self::on_expand_node))
+            .on_action(cx.listener(Self::on_collapse_node))
+            .on_action(cx.listener(Self::on_cancel_edit))
+            .on_action(cx.listener(Self::on_delete_option))
+            .on_click(cx.listener(|this, _ev: &gpui::ClickEvent, window, _cx| {
+                this.focus_handle.focus(window);
+            }))
             .p_4()
-            .gap_2()
             .size_full()
             .overflow_y_scroll()
-            .child(self.render_nodes(&nodes, "", window, cx))
+            .child(rows)
     }
 }
 

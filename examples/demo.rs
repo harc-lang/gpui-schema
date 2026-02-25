@@ -124,6 +124,7 @@ fn main() {
 
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
+        schema_gui::init(cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);

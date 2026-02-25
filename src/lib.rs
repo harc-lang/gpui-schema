@@ -2,7 +2,7 @@ mod node;
 mod view;
 
 pub use node::{build_tree, ConfigNode, NodeKind};
-pub use view::SchemaForm;
+pub use view::{init, SchemaForm};
 
 pub use schemars::schema_for;
 
