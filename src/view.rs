@@ -712,7 +712,6 @@ impl SchemaForm {
                                 gpui_component::input::Input::new(input_entity)
                                     .appearance(false)
                                     .xsmall()
-                                    .text_color(cx.theme().muted_foreground)
                                     .disabled(!enabled),
                             ),
                         );
@@ -722,7 +721,10 @@ impl SchemaForm {
                     row = row.child(
                         div()
                             .w(px(200.0))
-                            .text_sm()
+                            .h_5()
+                            .items_center()
+                            .pl(px(4.0))
+                            .text_xs()
                             .text_color(cx.theme().muted_foreground)
                             .child(text),
                     );
@@ -793,7 +795,6 @@ impl SchemaForm {
                                         gpui_component::input::Input::new(input_entity)
                                             .appearance(false)
                                             .xsmall()
-                                            .text_color(cx.theme().muted_foreground)
                                             .disabled(!enabled),
                                     ),
                                 );
@@ -804,7 +805,10 @@ impl SchemaForm {
                             row = row.child(
                                 div()
                                     .w(px(200.0))
-                                    .text_sm()
+                                    .h_5()
+                                    .items_center()
+                                    .pl(px(4.0))
+                                    .text_xs()
                                     .text_color(cx.theme().muted_foreground)
                                     .child(text),
                             );
@@ -813,7 +817,10 @@ impl SchemaForm {
                         row = row.child(
                             div()
                                 .w(px(200.0))
-                                .text_sm()
+                                .h_5()
+                                .items_center()
+                                .pl(px(4.0))
+                                .text_xs()
                                 .text_color(cx.theme().muted_foreground)
                                 .child("None"),
                         );
