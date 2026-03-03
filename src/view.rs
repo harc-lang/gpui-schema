@@ -250,7 +250,7 @@ impl SchemaForm {
 
     // --- Focus helpers ---
 
-    fn editing(&self) -> bool {
+    pub fn editing(&self) -> bool {
         self.editing_path.is_some()
     }
 
@@ -899,24 +899,31 @@ impl SchemaForm {
             }
 
             NodeKind::RadioItem { selected, .. } => {
+                let parent = path
+                    .rfind('.')
+                    .map(|i| path[..i].to_string())
+                    .unwrap_or_default();
+                let variant = node.key.clone();
                 h_flex()
+                    .id(SharedString::from(format!("{}-radio-row", path)))
                     .gap_2()
+                    .w_full()
                     .items_center()
+                    .cursor_pointer()
+                    .on_click(cx.listener({
+                        let parent = parent.clone();
+                        let variant = variant.clone();
+                        move |this, _, window, cx| {
+                            if this.is_enabled(&parent) {
+                                this.select_radio(&parent, &variant, window, cx);
+                            }
+                        }
+                    }))
                     .child(
                         Radio::new(SharedString::from(path.to_string()))
                             .label(format_label(&node.key))
                             .checked(*selected)
                             .disabled(!enabled)
-                            .on_click(cx.listener({
-                                let parent = path
-                                    .rfind('.')
-                                    .map(|i| path[..i].to_string())
-                                    .unwrap_or_default();
-                                let variant = node.key.clone();
-                                move |this, _, window, cx| {
-                                    this.select_radio(&parent, &variant, window, cx);
-                                }
-                            }))
                             .small(),
                     )
                     .into_any_element()
