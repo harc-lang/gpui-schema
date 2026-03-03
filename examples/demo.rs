@@ -1,6 +1,6 @@
 use gpui::{actions, App, AppContext as _, Application, KeyBinding, Menu, MenuItem, WindowOptions, px, size};
 use gpui_component::Root;
-use schema_gui::{NodeFilter, SchemaForm};
+use gpui_schema::{NodeFilter, SchemaForm};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -124,7 +124,7 @@ fn main() {
 
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
-        schema_gui::init(cx);
+        gpui_schema::init(cx);
 
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
