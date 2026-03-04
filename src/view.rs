@@ -6,8 +6,8 @@ use gpui::{
     StatefulInteractiveElement as _, Styled, Window,
 };
 use gpui_component::{
-    checkbox::Checkbox, h_flex, input::InputState, radio::Radio, switch::Switch, v_flex,
-    ActiveTheme, Disableable as _, Sizable,
+    checkbox::Checkbox, h_flex, input::InputState, radio::Radio, switch::Switch,
+    tooltip::Tooltip, v_flex, ActiveTheme, Disableable as _, Sizable,
 };
 use serde_json::{Map, Value};
 
@@ -16,9 +16,6 @@ use crate::node::{
     NodeKind,
 };
 use crate::NodeFilter;
-
-/// Fixed min-width for the controls column so descriptions align vertically.
-const CONTROLS_WIDTH: f32 = 400.0;
 
 // --- Actions ---
 
@@ -639,26 +636,20 @@ impl SchemaForm {
             row = row.bg(cx.theme().list_active);
         }
 
-        // Left column: fixed width, indent is internal padding
         row = row.child(
             h_flex()
-                .w(px(CONTROLS_WIDTH))
-                .flex_shrink_0()
+                .flex_1()
                 .pl(indent)
                 .gap_2()
                 .items_center()
                 .child(controls),
         );
 
-        // Right column: description, left-aligned
         if let Some(desc) = &node.description {
-            row = row.child(
-                div()
-                    .pl_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(desc.clone()),
-            );
+            let desc = desc.clone();
+            row = row.tooltip(move |window, cx| {
+                Tooltip::new(desc.clone()).build(window, cx)
+            });
         }
 
         row.into_any_element()
@@ -673,6 +664,7 @@ impl SchemaForm {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let path_owned = path.to_string();
+        let label = label_element(&node.key, cx);
 
         match &node.kind {
             NodeKind::Bool => {
@@ -685,72 +677,32 @@ impl SchemaForm {
                             .checked(checked)
                             .disabled(!enabled)
                             .on_click(cx.listener({
-                                let p = path_owned.clone();
+                                let p = path_owned;
                                 move |this, _, _, cx| this.toggle_bool(&p, cx)
                             }))
                             .small(),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(format_label(&node.key)),
-                    )
+                    .child(label)
                     .into_any_element()
             }
 
             NodeKind::String | NodeKind::Integer | NodeKind::Float => {
-                let mut row = h_flex().gap_2().items_center().child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().foreground)
-                        .min_w(px(120.0))
-                        .child(format_label(&node.key)),
-                );
-                let is_editing_this = self.editing_path.as_deref() == Some(path);
-                if is_editing_this {
-                    if let Some(input_entity) = self.find_input(path) {
-                        row = row.child(
-                            div().w(px(200.0)).child(
-                                gpui_component::input::Input::new(input_entity)
-                                    .appearance(false)
-                                    .xsmall()
-                                    .disabled(!enabled),
-                            ),
-                        );
-                    }
-                } else {
-                    let text = value_to_string(&node.value, &node.kind);
-                    row = row.child(
-                        div()
-                            .w(px(200.0))
-                            .h_5()
-                            .items_center()
-                            .pl(px(4.0))
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(text),
-                    );
-                }
-                row.into_any_element()
+                let value = self.render_value(node, path, &node.kind, enabled, cx);
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .flex_1()
+                    .child(label)
+                    .child(value)
+                    .into_any_element()
             }
 
             NodeKind::Struct { type_name } => {
-                let arrow = if is_expanded { "▼" } else { "▶" };
+                let arrow = expand_arrow(is_expanded);
                 h_flex()
                     .gap_1()
                     .items_center()
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("{}-arrow", path)))
-                            .text_sm()
-                            .cursor_pointer()
-                            .child(arrow)
-                            .on_click(cx.listener({
-                                let p = path_owned.clone();
-                                move |this, _, _, cx| this.toggle_expand(&p, cx)
-                            })),
-                    )
+                    .child(self.arrow_button(path, arrow, cx))
                     .child(
                         div()
                             .text_sm()
@@ -764,140 +716,48 @@ impl SchemaForm {
                 is_some,
                 inner_kind,
             } => {
-                if inner_kind.is_some() {
-                    // Scalar option
-                    let mut row = h_flex()
-                        .gap_2()
-                        .items_center()
-                        .child(
-                            Switch::new(SharedString::from(format!("{}-opt", path)))
-                                .checked(*is_some)
-                                .disabled(!enabled)
-                                .on_click(cx.listener({
-                                    let p = path_owned.clone();
-                                    move |this, _, window, cx| {
-                                        this.toggle_option(&p, window, cx);
-                                    }
-                                }))
-                                .small(),
-                        )
-                        .child(
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().foreground)
-                                .min_w(px(120.0))
-                                .child(format_label(&node.key)),
-                        );
+                let toggle = Switch::new(SharedString::from(format!("{}-opt", path)))
+                    .checked(*is_some)
+                    .disabled(!enabled)
+                    .on_click(cx.listener({
+                        let p = path_owned.clone();
+                        move |this, _, window, cx| this.toggle_option(&p, window, cx)
+                    }))
+                    .small();
 
-                    if *is_some {
-                        let is_editing_this = self.editing_path.as_deref() == Some(path);
-                        if is_editing_this {
-                            if let Some(input_entity) = self.find_input(&path_owned) {
-                                row = row.child(
-                                    div().w(px(200.0)).child(
-                                        gpui_component::input::Input::new(input_entity)
-                                            .appearance(false)
-                                            .xsmall()
-                                            .disabled(!enabled),
-                                    ),
-                                );
-                            }
-                        } else {
-                            let ik = inner_kind.as_ref().unwrap();
-                            let text = value_to_string(&node.value, ik);
-                            row = row.child(
-                                div()
-                                    .w(px(200.0))
-                                    .h_5()
-                                    .items_center()
-                                    .pl(px(4.0))
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(text),
-                            );
-                        }
+                if let Some(inner) = inner_kind {
+                    // Scalar option: switch + label + value
+                    let value = if *is_some {
+                        self.render_value(node, path, inner, enabled, cx)
                     } else {
-                        row = row.child(
-                            div()
-                                .w(px(200.0))
-                                .h_5()
-                                .items_center()
-                                .pl(px(4.0))
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child("None"),
-                        );
-                    }
-                    row.into_any_element()
-                } else {
-                    // Struct option
-                    let arrow = if *is_some && is_expanded {
-                        "▼"
-                    } else if *is_some {
-                        "▶"
-                    } else {
-                        " "
+                        value_element("None", cx)
                     };
-                    let mut row = h_flex()
+                    h_flex()
                         .gap_2()
                         .items_center()
-                        .child(
-                            Switch::new(SharedString::from(format!("{}-opt", path)))
-                                .checked(*is_some)
-                                .disabled(!enabled)
-                                .on_click(cx.listener({
-                                    let p = path_owned.clone();
-                                    move |this, _, window, cx| {
-                                        this.toggle_option(&p, window, cx);
-                                    }
-                                }))
-                                .small(),
-                        );
+                        .flex_1()
+                        .child(toggle)
+                        .child(label)
+                        .child(value)
+                        .into_any_element()
+                } else {
+                    // Struct option: switch + optional arrow + label
+                    let mut row = h_flex().gap_2().items_center().child(toggle);
                     if *is_some {
-                        row = row.child(
-                            div()
-                                .id(SharedString::from(format!("{}-arrow", path)))
-                                .text_sm()
-                                .cursor_pointer()
-                                .child(arrow)
-                                .on_click(cx.listener({
-                                    let p = path_owned.clone();
-                                    move |this, _, _, cx| this.toggle_expand(&p, cx)
-                                })),
-                        );
+                        let arrow = expand_arrow(is_expanded);
+                        row = row.child(self.arrow_button(path, arrow, cx));
                     }
-                    row = row.child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(format_label(&node.key)),
-                    );
-                    row.into_any_element()
+                    row.child(label).into_any_element()
                 }
             }
 
-            NodeKind::RadioGroup { .. } => {
-                let arrow = if is_expanded { "▼" } else { "▶" };
+            NodeKind::RadioGroup { .. } | NodeKind::Checkboxes { .. } => {
+                let arrow = expand_arrow(is_expanded);
                 h_flex()
                     .gap_1()
                     .items_center()
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("{}-arrow", path)))
-                            .text_sm()
-                            .cursor_pointer()
-                            .child(arrow)
-                            .on_click(cx.listener({
-                                let p = path_owned.clone();
-                                move |this, _, _, cx| this.toggle_expand(&p, cx)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(format_label(&node.key)),
-                    )
+                    .child(self.arrow_button(path, arrow, cx))
+                    .child(label)
                     .into_any_element()
             }
 
@@ -951,32 +811,51 @@ impl SchemaForm {
                     )
                     .into_any_element()
             }
+        }
+    }
 
-            NodeKind::Checkboxes { .. } => {
-                let arrow = if is_expanded { "▼" } else { "▶" };
-                h_flex()
-                    .gap_1()
-                    .items_center()
+    /// Render the value column for a scalar field — either an inline input or static text.
+    fn render_value(
+        &self,
+        node: &ConfigNode,
+        path: &str,
+        kind: &NodeKind,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let is_editing = self.editing_path.as_deref() == Some(path);
+        if is_editing {
+            if let Some(input_entity) = self.find_input(path) {
+                return div()
+                    .flex_1()
                     .child(
-                        div()
-                            .id(SharedString::from(format!("{}-arrow", path)))
-                            .text_sm()
-                            .cursor_pointer()
-                            .child(arrow)
-                            .on_click(cx.listener({
-                                let p = path_owned;
-                                move |this, _, _, cx| this.toggle_expand(&p, cx)
-                            })),
+                        gpui_component::input::Input::new(input_entity)
+                            .appearance(false)
+                            .xsmall()
+                            .disabled(!enabled),
                     )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(cx.theme().foreground)
-                            .child(format_label(&node.key)),
-                    )
-                    .into_any_element()
+                    .into_any_element();
             }
         }
+        let text = value_to_string(&node.value, kind);
+        value_element(&text, cx)
+    }
+
+    /// Render the expand/collapse arrow button for a given path.
+    fn arrow_button(
+        &self,
+        path: &str,
+        arrow: &'static str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = path.to_string();
+        div()
+            .id(SharedString::from(format!("{}-arrow", path)))
+            .text_sm()
+            .cursor_pointer()
+            .child(arrow)
+            .on_click(cx.listener(move |this, _, _, cx| this.toggle_expand(&p, cx)))
+            .into_any_element()
     }
 }
 
@@ -1054,6 +933,30 @@ fn value_to_string(value: &Value, kind: &NodeKind) -> String {
         },
         _ => value.to_string(),
     }
+}
+
+fn label_element(key: &str, cx: &mut Context<SchemaForm>) -> gpui::AnyElement {
+    div()
+        .text_sm()
+        .text_color(cx.theme().foreground)
+        .child(format_label(key))
+        .into_any_element()
+}
+
+fn value_element(text: &str, cx: &mut Context<SchemaForm>) -> gpui::AnyElement {
+    div()
+        .flex_1()
+        .h_5()
+        .items_center()
+        .pl(px(4.0))
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.to_string())
+        .into_any_element()
+}
+
+fn expand_arrow(is_expanded: bool) -> &'static str {
+    if is_expanded { "▼" } else { "▶" }
 }
 
 fn collect_expanded_paths(
