@@ -1,9 +1,9 @@
 use std::collections::HashSet;
 
 use gpui::{
-    actions, div, px, App, AppContext as _, Context, Entity, Focusable,
-    FocusHandle, InteractiveElement as _, IntoElement, KeyBinding, ParentElement, Render,
-    SharedString, StatefulInteractiveElement as _, Styled, Window,
+    actions, div, px, App, AppContext as _, Context, Entity, EventEmitter, Focusable, FocusHandle,
+    InteractiveElement as _, IntoElement, KeyBinding, ParentElement, Render, SharedString,
+    StatefulInteractiveElement as _, Styled, Window,
 };
 use gpui_component::{
     checkbox::Checkbox, h_flex, input::InputState, radio::Radio, switch::Switch, v_flex,
@@ -52,6 +52,13 @@ pub fn init(cx: &mut App) {
     ]);
 }
 
+/// Event emitted by [`SchemaForm`] when the user changes a value.
+pub enum SchemaFormEvent {
+    /// The form's config value changed. Call [`SchemaForm::to_value`] to
+    /// read the new value.
+    Changed,
+}
+
 /// A GUI form for editing a configuration derived from a JSON Schema.
 ///
 /// Create one with [`SchemaForm::new`], passing a `schemars::Schema` and
@@ -62,11 +69,12 @@ pub struct SchemaForm {
     defs: Map<String, Value>,
     filter: Option<Box<dyn NodeFilter>>,
     inputs: Vec<(String, Entity<InputState>)>,
-    dirty: bool,
     focus_handle: FocusHandle,
     selected: usize,
     editing_path: Option<String>,
 }
+
+impl EventEmitter<SchemaFormEvent> for SchemaForm {}
 
 impl Focusable for SchemaForm {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
@@ -97,7 +105,6 @@ impl SchemaForm {
             defs,
             filter: None,
             inputs: Vec::new(),
-            dirty: false,
             focus_handle: cx.focus_handle(),
             selected: 0,
             editing_path: None,
@@ -123,10 +130,6 @@ impl SchemaForm {
 
     pub fn to_config<T: serde::de::DeserializeOwned>(&self) -> Result<T, serde_json::Error> {
         serde_json::from_value(self.to_value())
-    }
-
-    pub fn is_dirty(&self) -> bool {
-        self.dirty
     }
 
     // --- Input sync ---
@@ -197,8 +200,8 @@ impl SchemaForm {
                             move |this: &mut SchemaForm, _entity, event: &gpui_component::input::InputEvent, cx| {
                                 match event {
                                     gpui_component::input::InputEvent::Change => {
-                                        this.dirty = true;
                                         this.sync_inputs_to_nodes(cx);
+                                        cx.emit(SchemaFormEvent::Changed);
                                         cx.notify();
                                     }
                                     gpui_component::input::InputEvent::Focus => {
@@ -288,7 +291,7 @@ impl SchemaForm {
             if matches!(node.kind, NodeKind::Bool) {
                 let current = node.value.as_bool().unwrap_or(false);
                 node.value = Value::Bool(!current);
-                self.dirty = true;
+                cx.emit(SchemaFormEvent::Changed);
                 cx.notify();
             }
         }
@@ -307,8 +310,8 @@ impl SchemaForm {
             let parts: Vec<&str> = parent_path.split('.').collect();
             rebuild_checkboxes_value(&mut self.nodes, &parts);
         }
-        self.dirty = true;
         self.rebuild_inputs(window, cx);
+        cx.emit(SchemaFormEvent::Changed);
         cx.notify();
     }
 
@@ -323,8 +326,8 @@ impl SchemaForm {
         select_radio_in_nodes(&mut self.nodes, &parts, variant_name, &self.defs.clone());
         let selected_path = format!("{}.{}", parent_path, variant_name);
         self.expanded.insert(selected_path);
-        self.dirty = true;
         self.rebuild_inputs(window, cx);
+        cx.emit(SchemaFormEvent::Changed);
         cx.notify();
     }
 
@@ -359,8 +362,8 @@ impl SchemaForm {
                 self.expanded.insert(path.to_string());
             }
         }
-        self.dirty = true;
         self.rebuild_inputs(window, cx);
+        cx.emit(SchemaFormEvent::Changed);
         cx.notify();
     }
 
